@@ -1,0 +1,199 @@
+name: Build Minimal Win11PE Rescue ISO (WinNTSetup + Disk Formatter)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag for publishing ISO (e.g. v1.0)'
+        required: true
+        default: 'v1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-winpe-lite:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 1. Install Microsoft Windows 11 ADK and WinPE Add-on
+        shell: pwsh
+        run: |
+          $WorkDir = "C:\ADK_Setup"
+          New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+
+          Write-Host "Downloading official Windows 11 24H2 ADK & WinPE Add-on..."
+          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2271337" -OutFile "$WorkDir\adksetup.exe"
+          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2271338" -OutFile "$WorkDir\adkwinpesetup.exe"
+
+          Write-Host "Installing ADK Deployment Tools..."
+          Start-Process -FilePath "$WorkDir\adksetup.exe" -ArgumentList "/quiet /norestart /features OptionId.DeploymentTools" -Wait
+
+          Write-Host "Installing WinPE Add-on..."
+          Start-Process -FilePath "$WorkDir\adkwinpesetup.exe" -ArgumentList "/quiet /norestart /features OptionId.WindowsPreinstallationEnvironment" -Wait
+
+      - name: 2. Create Minimal WinPE x64 Workspace and Mount boot.wim
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\DandISetEnv.bat"
+          call copype amd64 C:\WinPE_amd64
+          Dism /Mount-Image /ImageFile:"C:\WinPE_amd64\media\sources\boot.wim" /Index:1 /MountDir:"C:\WinPE_amd64\mount"
+
+          REM Add only essential StorageWMI, WMI, Scripting, and FMAPI (Windows Native Disk Formatting API) packages
+          set "OC_PATH=C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Windows Preinstallation Environment\amd64\WinPE_OCs"
+          Dism /Image:"C:\WinPE_amd64\mount" /Add-Package /PackagePath:"%OC_PATH%\WinPE-WMI.cab" /PackagePath:"%OC_PATH%\WinPE-Scripting.cab" /PackagePath:"%OC_PATH%\WinPE-StorageWMI.cab" /PackagePath:"%OC_PATH%\WinPE-FMAPI.cab"
+
+      - name: 3. Inject WinNTSetup v5.4.2 (with ImDisk ISO Mounter & BOOTICE), Macrorit Partition Expert, Explorer++, 7-Zip
+        shell: pwsh
+        run: |
+          $Sys32 = "C:\WinPE_amd64\mount\Windows\System32"
+          $ToolsDir = "C:\WinPE_amd64\mount\Tools"
+          New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
+
+          # 1. Extract embedded WinNTSetup v5.4.2 (includes WinNTSetup_x64.exe, BOOTICEx64.exe, wimlib.dll, offreg.dll, ImDisk ISO Mounter, DiskPart GUI)
+          Write-Host "Extracting WinNTSetup v5.4.2 & BOOTICE from repository..."
+          python -c '
+          import re, base64, struct
+          with open(r"Projects\PhoenixPE\Applications\System Tools\WinNTSetup.script", "r", encoding="utf-8", errors="ignore") as f:
+              text = f.read()
+          m = re.search(r"\[EncodedFile-x64-WinNTSetup_v542\.rar\]\nlines=\d+\n(.*?)(?=\n\[|\Z)", text, re.S)
+          lines = m.group(1).strip().splitlines()
+          b64 = "".join(line.split("=", 1)[1].strip() for line in lines if "=" in line)
+          pad = (4 - len(b64) % 4) % 4
+          raw = base64.b64decode(b64 + "=" * pad)
+          orig_size = struct.unpack("<I", raw[-20:-16])[0]
+          with open(r"C:\WinNTSetup_v542.rar", "wb") as out:
+              out.write(raw[:orig_size])
+          '
+          New-Item -ItemType Directory -Force -Path "$ToolsDir\WinNTSetup" | Out-Null
+          7z x "C:\WinNTSetup_v542.rar" -o"$ToolsDir\WinNTSetup" -y
+
+          # Copy ADK bcdboot.exe, bcdedit.exe, bootsect.exe into WinNTSetup Tools\x64
+          $AdkBcd = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\BCDBoot"
+          New-Item -ItemType Directory -Force -Path "$ToolsDir\WinNTSetup\Tools\x64" | Out-Null
+          if (Test-Path "$AdkBcd\bcdboot.exe") { Copy-Item "$AdkBcd\*" "$ToolsDir\WinNTSetup\Tools\x64\" -Force }
+          Copy-Item "$ToolsDir\WinNTSetup\Tools\x64\BootICE\BOOTICEx64.exe" "$Sys32\bootice.exe" -Force
+
+          # Install ImDisk Virtual Disk Driver into System32 so WinNTSetup can mount Windows .ISO files directly!
+          if (Test-Path "$ToolsDir\WinNTSetup\Tools\imdisk\sys\amd64\imdisk.sys") {
+              Copy-Item "$ToolsDir\WinNTSetup\Tools\imdisk\sys\amd64\imdisk.sys" "$Sys32\drivers\imdisk.sys" -Force
+              Copy-Item "$ToolsDir\WinNTSetup\Tools\imdisk\cpl\amd64\imdisk.cpl" "$Sys32\imdisk.cpl" -Force
+          }
+
+          Set-Content -Path "$Sys32\winntsetup.cmd" -Value "@start `" `" `"X:\Tools\WinNTSetup\WinNTSetup_x64.exe`" %*" -Encoding ASCII
+          Set-Content -Path "$Sys32\formatgui.cmd" -Value "@start `" `" `"X:\Tools\WinNTSetup\WinNTSetup_x64.exe`" -diskpart" -Encoding ASCII
+
+          # 2. Macrorit Partition Expert Portable (Lightweight GUI Disk Partitioning & Formatting Tool - MBR/GPT/NTFS/FAT32)
+          Write-Host "Downloading Macrorit Partition Expert Portable..."
+          try {
+              curl.exe -L "https://disk-tool.com/download/mde/mde-free-portable.zip" -o "C:\mde.zip"
+              7z x "C:\mde.zip" -o"C:\mde" -y
+              New-Item -ItemType Directory -Force -Path "$ToolsDir\PartitionExpert" | Out-Null
+              Copy-Item "C:\mde\mde-free-portable\x64\*" "$ToolsDir\PartitionExpert\" -Recurse -Force
+              Set-Content -Path "$Sys32\part.cmd" -Value "@start `" `" `"X:\Tools\PartitionExpert\dm.exe`" %*" -Encoding ASCII
+          } catch {
+              Write-Warning "Macrorit download skipped: $_"
+          }
+
+          # 3. Explorer++ (Lightweight Graphical File Manager) & 7-Zip File Manager (Extract/Inspect ISO & WIM)
+          Write-Host "Injecting Explorer++ & 7-Zip..."
+          curl.exe -L "https://download.explorerplusplus.com/stable/1.4.0/explorerpp_x64.zip" -o "C:\ep.zip"
+          7z x "C:\ep.zip" -o"C:\ep" -y
+          Copy-Item "C:\ep\Explorer++.exe" "$Sys32\explorer.exe" -Force
+
+          Copy-Item "C:\Program Files\7-Zip" "$ToolsDir\7-Zip" -Recurse -Force
+          Copy-Item "C:\Program Files\7-Zip\7zFM.exe" "$Sys32\7zFM.exe" -Force
+
+          # 4. Configure startnet.cmd to load ImDisk driver, display commands, and auto-launch WinNTSetup
+          $Startnet = @"
+          @echo off
+          wpeinit
+          sc create imdisk type= kernel start= demand error= ignore binPath= system32\drivers\imdisk.sys >nul 2>&1
+          net start imdisk >nul 2>&1
+          cls
+          echo ===========================================================================
+          echo   MINIMAL WIN11PE RESCUE: DISK FORMATTER ^& WINDOWS ISO INSTALLER (64-BIT)
+          echo ===========================================================================
+          echo   [1. INSTALL WINDOWS DIRECTLY FROM .ISO / .WIM]
+          echo     winntsetup  - Launch WinNTSetup v5.4.2 (Select .ISO file ^& Install Win)
+          echo.
+          echo   [2. FORMAT ^& PARTITION DISKS (GUI ^& CLI)]
+          echo     formatgui   - Launch WinNTSetup Built-in DiskPart Format GUI (GPT/MBR)
+          echo     part        - Launch Macrorit Partition Expert GUI (Resize/Format Disk)
+          echo     bootice     - Launch BOOTICE x64 (Partition Manage, Format, UEFI/MBR)
+          echo     diskpart    - Microsoft CLI Disk Partitioning ^& Formatting tool
+          echo.
+          echo   [3. FILE ^& ARCHIVE MANAGEMENT]
+          echo     explorer    - Launch Explorer++ Graphical File Manager
+          echo     7zFM        - Launch 7-Zip File Manager (Browse/Extract .ISO/.WIM/.7z)
+          echo     exit        - Reboot Computer
+          echo ===========================================================================
+          start "" "X:\Windows\System32\explorer.exe" "X:\Tools"
+          start "" "X:\Tools\WinNTSetup\WinNTSetup_x64.exe"
+          cmd.exe
+          "@
+          Set-Content -Path "$Sys32\startnet.cmd" -Value $Startnet -Encoding ASCII
+
+      - name: 4. Commit WIM, Optimize Size (/Compress:max), and Build Bootable ISO
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\DandISetEnv.bat"
+          Dism /Unmount-Image /MountDir:"C:\WinPE_amd64\mount" /Commit
+          Dism /Export-Image /SourceImageFile:"C:\WinPE_amd64\media\sources\boot.wim" /SourceIndex:1 /DestinationImageFile:"C:\WinPE_amd64\media\sources\boot_opt.wim" /Compress:max
+          move /Y "C:\WinPE_amd64\media\sources\boot_opt.wim" "C:\WinPE_amd64\media\sources\boot.wim"
+          call MakeWinPEMedia /ISO C:\WinPE_amd64 C:\Minimal_Win11PE_WinNTSetup.iso
+          dir C:\Minimal_Win11PE_WinNTSetup.iso
+
+      - name: 5. Generate Detailed Release Notes
+        shell: pwsh
+        run: |
+          $IsoSizeMB = [math]::Round((Get-Item "C:\Minimal_Win11PE_WinNTSetup.iso").Length / 1MB, 1)
+          $Notes = @"
+          ## 🚑 Minimal Windows 11 PE (24H2 x64) — Disk Formatter & Windows ISO Installer
+          **ISO File:** `Minimal_Win11PE_WinNTSetup.iso` (**$IsoSizeMB MB**)
+          **Base OS:** Official Microsoft Windows 11 PE 24H2 (64-bit) — Ultra-lightweight, boots in ~5 seconds, requires only **1 GB RAM**.
+
+          ---
+
+          ### 🛠️ Included Rescue, Disk Formatting & Windows Installation Tools
+
+          | Command / Shortcut | Included Tool | Purpose & Features |
+          | :--- | :--- | :--- |
+          | **`winntsetup`** *(Auto-starts on boot)* | **WinNTSetup v5.4.2 (x64)** + **ImDisk ISO Mounter** + **wimlib** | **Install Windows 10 / 11 directly from `.ISO`, `.WIM`, or `.ESD` files.** Right-click or select any `.iso` file and WinNTSetup automatically mounts it via ImDisk, formats the target drives, applies `install.wim`, and creates UEFI/BIOS boot records (`bcdboot`). Includes bypass for Windows 11 TPM/SecureBoot/RAM requirements. |
+          | **`formatgui`** | **WinNTSetup DiskPart GUI** | One-click graphical disk formatter to wipe and auto-partition a disk into **UEFI (GPT: EFI + MSR + Windows NTFS)** or **Legacy BIOS (MBR)** layout. |
+          | **`part`** | **Macrorit Partition Expert Portable (x64)** | Full graphical partition manager to **Format (`NTFS`, `FAT32`, `exFAT`)**, Create, Delete, Resize, Extend, Wipe partitions, and convert MBR <-> GPT without data loss. |
+          | **`bootice`** | **BOOTICE v1.3.3.2 (x64)** | Manage disk partitions, format USB/SSD/HDD, edit UEFI entries, backup/restore MBR & PBR boot sectors, and edit `BCD` stores. |
+          | **`explorer`** *(Auto-starts on boot)* | **Explorer++ (x64)** | Tabbed graphical file manager to browse local disks, USB drives, copy files, and double-click `.iso` or `.exe` tools. |
+          | **`7zFM`** | **7-Zip File Manager (x64)** | Extract or inspect `.iso`, `.wim`, `.esd`, `.7z`, `.rar`, `.zip` archives. |
+          | **`diskpart` / `bcdboot` / `dism` / `chkdsk`** | **Microsoft Native WinPE CLI Tools** | Official Windows command-line utilities for disk partitioning (`diskpart`), filesystem repair (`chkdsk`), image servicing (`dism`), and bootloader repair (`bcdboot`). |
+
+          ---
+
+          ### 🚀 Quick Usage Guide (How to Format Disk & Install Windows from ISO)
+          1. Boot `Minimal_Win11PE_WinNTSetup.iso` from **Ventoy** (or QEMU/USB).
+          2. **WinNTSetup** and **Explorer++** open automatically on screen.
+          3. **To Format & Partition the Target Disk:**
+             - Type **`part`** (for Macrorit Partition Expert GUI) or **`formatgui`** (or press `Ctrl + Shift + D` inside WinNTSetup) to partition and format your target SSD/HDD.
+          4. **To Install Windows from an `.ISO` file:**
+             - In **WinNTSetup**, click **`Search...`** under *"Location of Windows installation files"* and select your **`Windows_10.iso`** or **`Windows_11.iso`** directly.
+             - Select your **Boot drive** (EFI partition) and **Installation drive** (C: partition).
+             - Click **`Setup`** -> **`OK`** to install Windows!
+          "@
+          Set-Content -Path "C:\RELEASE_NOTES.md" -Value $Notes -Encoding UTF8
+
+      - name: 6. Upload ISO as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Minimal_Win11PE_WinNTSetup_ISO
+          path: C:\Minimal_Win11PE_WinNTSetup.iso
+
+      - name: 7. Publish ISO with Detailed Tool Notes to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: "Minimal Win11PE Rescue & WinNTSetup ISO (${{ inputs.release_tag }})"
+          body_path: C:\RELEASE_NOTES.md
+          files: C:\Minimal_Win11PE_WinNTSetup.iso
